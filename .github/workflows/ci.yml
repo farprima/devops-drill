@@ -1,0 +1,256 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  # Tombol "Run workflow" manual di tab Actions.
+  workflow_dispatch:
+
+# Push baru ke branch yang sama membatalkan run lama, kecuali di main: build+push image jangan diputus di tengah.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+# Default seminimal mungkin; job yang butuh lebih (image) menambah sendiri.
+permissions:
+  contents: read
+
+# shell: bash = bash -eo pipefail, jadi kegagalan di tengah pipeline (curl | jq) ikut menggagalkan step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          # Cache ~/.npm berdasarkan hash package-lock.json, npm ci jadi jauh lebih cepat.
+          cache: npm
+
+      # npm ci, bukan npm install: persis mengikuti package-lock.json dan gagal kalau lock tidak sinkron.
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      # Lint script shell (shellcheck sudah terpasang di runner Ubuntu).
+      - run: shellcheck scripts/*.sh
+
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # --wait: perintah baru selesai setelah semua healthcheck lulus (atau gagal kalau ada yang unhealthy).
+      - name: Start stack
+        run: docker compose up --build --detach --wait --wait-timeout 120
+
+      - name: Image size
+        run: |
+          docker image ls tryout-api:local
+          size="$(docker image inspect tryout-api:local --format '{{.Size}}')"
+          echo "Image size: $((size / 1000 / 1000)) MB ($size bytes)"
+          echo "tryout-api:local image size: $((size / 1000 / 1000)) MB" >> "$GITHUB_STEP_SUMMARY"
+          # Kriteria L1: di bawah sekitar 250 MB.
+          test "$size" -lt 250000000
+
+      - name: Runs as non-root
+        run: |
+          uid="$(docker compose exec -T api id -u)"
+          echo "uid=$uid"
+          test "$uid" != "0"
+
+      - name: Health
+        run: |
+          curl -fsS http://localhost:3000/health | tee /dev/stderr \
+            | jq -e '.status == "ok" and .db == "ok" and .redis == "ok"'
+
+      - name: Submission and leaderboard cache
+        run: |
+          # -w http_code: cek status persis, bukan hanya "tidak error".
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://localhost:3000/api/submissions \
+            -H 'Content-Type: application/json' -d '{"student":"Smoke","score":91}')"
+          test "$code" = "201"
+
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://localhost:3000/api/submissions \
+            -H 'Content-Type: application/json' -d '{"student":"","score":101}')"
+          test "$code" = "400"
+
+          # Panggilan pertama setelah submit = MISS (cache sudah di-invalidate), kedua = HIT dari Redis.
+          first="$(curl -fsS -D - -o /dev/null http://localhost:3000/api/leaderboard | tr -d '\r' | awk -F': ' 'tolower($1) == "x-cache" {print $2}')"
+          second="$(curl -fsS -D - -o /dev/null http://localhost:3000/api/leaderboard | tr -d '\r' | awk -F': ' 'tolower($1) == "x-cache" {print $2}')"
+          echo "first=$first second=$second"
+          test "$first" = "MISS"
+          test "$second" = "HIT"
+          curl -fsS http://localhost:3000/api/leaderboard | jq -e '.[0].student == "Smoke"'
+
+      - name: Backup rotation and restore test
+        run: |
+          # 9 backup (jeda 1 detik karena nama file per detik), yang tersisa harus 7.
+          for i in $(seq 9); do ./scripts/backup.sh; sleep 1; done
+          ls -l backups
+          test "$(find backups -name 'tryout-*.sql.gz' | wc -l)" -eq 7
+          ./scripts/restore-test.sh
+
+      - name: Production compose file is valid
+        run: POSTGRES_PASSWORD=dummy docker compose -f deploy/compose.prod.yml config --quiet
+
+      - name: Graceful shutdown on SIGTERM
+        run: |
+          docker compose stop api
+          docker compose logs api | tail -n 5
+          # Exit code 0 dan log "bye" = SIGTERM ditangani app, bukan dibunuh paksa (137) oleh Docker.
+          # grep tanpa -q: -q berhenti membaca lebih awal, dan dengan pipefail itu bisa jadi SIGPIPE di sisi kiri.
+          docker compose logs api | grep '"msg":"bye"'
+          test "$(docker inspect --format '{{.State.ExitCode}}' "$(docker compose ps --all --quiet api)")" = "0"
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs
+
+      # always(): bersihkan juga kalau step sebelumnya gagal. -v ikut menghapus volume database.
+      - name: Tear down
+        if: always()
+        run: docker compose down --volumes
+
+  # Jalur tanpa Docker: unit systemd + nginx dari apt, seperti di VM, dengan PostgreSQL dan Redis sebagai service container.
+  systemd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: tryout
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U app -d tryout"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Build
+        run: npm ci && npm run build
+
+      - name: Install app like on the VM
+        run: |
+          sudo useradd --system --home /opt/tryout-api --shell /usr/sbin/nologin tryout
+          sudo mkdir -p /opt/tryout-api /etc/tryout-api
+          # Rakit folder rilis sebagai user biasa (sudo tidak membawa PATH ke node dari setup-node), lalu copy.
+          mkdir release
+          cp -r package.json package-lock.json dist migrations release/
+          (cd release && npm ci --omit=dev --ignore-scripts)
+          sudo cp -r release/. /opt/tryout-api/
+          # Unit memanggil /usr/bin/node (lokasi dari apt NodeSource); di runner node ada di toolcache.
+          sudo ln -sf "$(command -v node)" /usr/bin/node
+          printf 'DATABASE_URL=postgres://app:app@127.0.0.1:5432/tryout\nREDIS_URL=redis://127.0.0.1:6379\n' \
+            | sudo install -m 600 -o root -g root /dev/stdin /etc/tryout-api/env
+          sudo cp deploy/tryout-api.service /etc/systemd/system/
+          sudo systemd-analyze verify /etc/systemd/system/tryout-api.service
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now tryout-api
+
+      - name: Health on 127.0.0.1:3000
+        run: |
+          for i in $(seq 30); do curl -fsS http://127.0.0.1:3000/health && break; sleep 1; done
+          curl -fsS http://127.0.0.1:3000/health | jq -e '.status == "ok" and .redis == "ok"'
+          systemctl show tryout-api --property=MainPID,User,ActiveState
+
+      - name: nginx in front on port 80
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq nginx
+          sudo cp deploy/nginx/tryout.conf /etc/nginx/sites-available/tryout.conf
+          sudo ln -sf /etc/nginx/sites-available/tryout.conf /etc/nginx/sites-enabled/tryout.conf
+          sudo rm -f /etc/nginx/sites-enabled/default
+          sudo nginx -t
+          sudo systemctl reload nginx
+          curl -fsS http://localhost/health | jq -e '.status == "ok"'
+          curl -fsS -X POST http://localhost/api/submissions -H 'Content-Type: application/json' -d '{"student":"Nginx","score":77}'
+          echo
+          # Body di atas client_max_body_size (1m) ditolak nginx dengan 413 sebelum sampai ke app.
+          head -c 2000000 /dev/zero | tr '\0' 'a' > big.txt
+          code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://localhost/api/submissions --data-binary @big.txt)"
+          test "$code" = "413"
+
+      - name: Graceful stop
+        run: |
+          sudo systemctl stop tryout-api
+          sudo journalctl -u tryout-api --no-pager | tail -n 5
+          sudo journalctl -u tryout-api --no-pager | grep '"msg":"bye"'
+          # Result=success: proses keluar sendiri dengan 0 setelah SIGTERM, tidak di-SIGKILL.
+          test "$(systemctl show tryout-api --property=Result --value)" = "success"
+
+      - name: Logs on failure
+        if: failure()
+        run: |
+          sudo journalctl -u tryout-api --no-pager || true
+          sudo cat /var/log/nginx/tryout.error.log || true
+
+  image:
+    # Image hanya dibuat dari kode yang sudah lulus test dan smoke.
+    needs: [test, smoke]
+    # Push hanya di main. Di branch reference image tetap di-build (tanpa push) untuk membuktikan workflow-nya.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/reference')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      # Izin GITHUB_TOKEN untuk push ke ghcr.io; tidak perlu personal access token.
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # Buildx (BuildKit) dibutuhkan untuk cache gha dan build multi-arsitektur.
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Menghitung tag dan label OCI (source repo, revision = SHA commit) dari konteks git.
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            # latest hanya di default branch (main).
+            type=raw,value=latest,enable={{is_default_branch}}
+            # sha-<7 karakter>: tag yang tidak pernah berubah, dipakai untuk pin dan rollback.
+            type=sha
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          # amd64 untuk server biasa, arm64 untuk VM Multipass di Mac Apple Silicon.
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.ref == 'refs/heads/main' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cache layer di GitHub Actions cache: build berikutnya hanya mengulang layer yang berubah.
+          # mode=max ikut menyimpan layer stage perantara (deps, build), bukan hanya image akhir.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
