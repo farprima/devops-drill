@@ -147,3 +147,55 @@ Selesai kalau:
 ### Branch `reference`
 
 Ada branch `reference` berisi satu contoh solusi untuk L1-L5 yang sudah terbukti hijau di GitHub Actions. Jangan dibuka sebelum mencoba sendiri: mentor memakainya untuk membandingkan dan memberi petunjuk bertahap, jadi latihannya hilang kalau jawabannya sudah dibaca duluan.
+
+## Solusi referensi (branch `reference`)
+
+Semua file di bawah dibuktikan di GitHub Actions (`.github/workflows/ci.yml`): job `test`, `smoke` (stack Compose asli), `systemd` (unit systemd + nginx dari apt, tanpa Docker), dan `image` (build amd64 + arm64; push ke GHCR hanya di `main`).
+
+| Latihan | File |
+| --- | --- |
+| L1 | `Dockerfile`, `.dockerignore` |
+| L2 | `compose.yml` |
+| L3 | `.github/workflows/ci.yml` |
+| L4 | `deploy/compose.prod.yml`, `deploy/nginx/tryout.conf`, `deploy/tryout-api.service` (alternatif tanpa Docker) |
+| L5 | `scripts/backup.sh`, `scripts/restore-test.sh` |
+
+Ukuran image akhir (`docker image ls` di job smoke): **185 MB** (node:24-alpine + dependency production + `dist` + `migrations`).
+
+### Runbook L4 (VM Multipass)
+
+```bash
+# di Mac
+multipass launch --name tryout --cpus 2 --memory 2G --disk 10G 24.04
+multipass shell tryout
+
+# di VM
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER" && newgrp docker
+echo "$GHCR_TOKEN" | docker login ghcr.io -u farprima --password-stdin   # PAT dengan scope read:packages
+sudo mkdir -p /opt/tryout && sudo chown "$USER" /opt/tryout && cd /opt/tryout
+# copy deploy/compose.prod.yml ke /opt/tryout/compose.yml, lalu buat .env:
+printf 'POSTGRES_PASSWORD=%s\nTAG=latest\n' "$(openssl rand -hex 16)" > .env && chmod 600 .env
+docker compose pull && docker compose up -d --wait
+
+sudo apt-get install -y nginx
+# pasang deploy/nginx/tryout.conf (perintah lengkap ada di komentar file itu)
+curl http://localhost/health
+
+# versi yang sedang jalan
+docker inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$(docker compose ps -q api)"
+
+# rollback: pin ke tag sha sebelumnya (lihat tab Packages / riwayat run), lalu
+sed -i 's/^TAG=.*/TAG=sha-1a2b3c4/' .env && docker compose up -d --wait
+```
+
+Docker service sudah enabled setelah install, dan `restart: unless-stopped` menyalakan lagi container setelah VM reboot.
+
+### Runbook L5
+
+```bash
+cd /opt/tryout && ./scripts/backup.sh       # backups/tryout-YYYYmmdd-HHMMSS.sql.gz, simpan 7 terbaru
+./scripts/restore-test.sh                   # restore ke database baru, bandingkan jumlah baris, hapus lagi
+crontab -e
+# 0 2 * * * cd /opt/tryout && ./scripts/backup.sh >> /opt/tryout/backup.log 2>&1
+```
