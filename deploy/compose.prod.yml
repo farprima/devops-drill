@@ -1,0 +1,81 @@
+# Compose untuk VM produksi: memakai image dari GHCR, tidak build di server.
+# Taruh di /opt/tryout/compose.yml bersama file .env (lihat README bagian L4), lalu:
+#   docker compose pull && docker compose up -d
+# Rollback: isi TAG di .env dengan tag sha sebelumnya (mis. TAG=sha-1a2b3c4), lalu `docker compose up -d`.
+name: tryout
+
+services:
+  api:
+    # TAG dari .env; default latest. Tag sha-xxxxxxx tidak pernah berubah, jadi itu yang dipakai untuk pin/rollback.
+    image: ghcr.io/farprima/devops-drill:${TAG:-latest}
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      # :? = wajib diisi; di produksi tidak boleh ada password default.
+      DATABASE_URL: postgres://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:?isi POSTGRES_PASSWORD di .env}@db:5432/${POSTGRES_DB:-tryout}
+      REDIS_URL: redis://redis:6379
+    ports:
+      # Hanya di loopback: yang bisa masuk cuma nginx di VM yang sama. Port yang di-publish Docker
+      # melewati aturan ufw, jadi "127.0.0.1:" ini yang benar-benar menutup port 3000 dari luar.
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+      start_interval: 1s
+    stop_grace_period: 15s
+    logging:
+      # Driver default json-file tidak dirotasi: tanpa ini log bisa memenuhi disk VM.
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?isi POSTGRES_PASSWORD di .env}
+      POSTGRES_DB: ${POSTGRES_DB:-tryout}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 20s
+      start_interval: 1s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+      start_interval: 1s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  pgdata:

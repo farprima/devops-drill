@@ -1,0 +1,68 @@
+# Alternatif tanpa Docker: jalankan node langsung di bawah systemd, PostgreSQL dan Redis dari apt.
+# Pasang:
+#   sudo useradd --system --home /opt/tryout-api --shell /usr/sbin/nologin tryout
+#   sudo mkdir -p /opt/tryout-api /etc/tryout-api
+#   (copy package*.json, dist/, migrations/ ke /opt/tryout-api, lalu di sana: sudo npm ci --omit=dev)
+#   sudo install -m 600 -o root -g root /dev/null /etc/tryout-api/env   # isi DATABASE_URL dan REDIS_URL
+#   sudo cp deploy/tryout-api.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now tryout-api
+#   journalctl -u tryout-api -f
+
+[Unit]
+Description=tryout-api (Express + PostgreSQL + Redis)
+Documentation=https://github.com/farprima/devops-drill
+# Tunggu network dan database lokal; Wants= menarik target network-online tanpa membuatnya wajib.
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+# Batas Restart= di bawah: kalau restart lebih dari 5 kali dalam 60 detik, berhenti mencoba (cek journalctl, jangan loop selamanya).
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tryout
+Group=tryout
+WorkingDirectory=/opt/tryout-api
+# File env milik root (mode 600) dibaca oleh systemd sebelum turun ke user tryout, jadi password tidak bisa
+# dibaca user lain dan tidak muncul di unit file. Nilai di file ini menimpa Environment= di bawah.
+EnvironmentFile=/etc/tryout-api/env
+# Listen hanya di loopback: dari luar harus lewat nginx.
+Environment=NODE_ENV=production HOST=127.0.0.1 PORT=3000
+# Path absolut (NodeSource apt memasang node di /usr/bin/node). Cek dengan: command -v node
+ExecStart=/usr/bin/node dist/server.js
+
+# Restart kalau crash atau exit bukan 0 (mis. database belum siap saat boot), tapi tidak saat di-stop manual.
+Restart=on-failure
+RestartSec=3s
+# systemctl stop mengirim SIGTERM; app butuh sampai 10 detik untuk graceful shutdown sebelum SIGKILL.
+TimeoutStopSec=15s
+
+# --- Hardening: batasi apa yang bisa dilakukan proses kalau app sampai dibobol.
+NoNewPrivileges=yes
+# Seluruh filesystem read-only untuk proses ini. App tidak menulis file apa pun (log ke stdout -> journald),
+# jadi tidak perlu ReadWritePaths. Kalau nanti butuh tempat tulis, pakai StateDirectory=tryout-api
+# (otomatis /var/lib/tryout-api yang writable) atau ReadWritePaths=/path/yang/perlu.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Hanya butuh TCP/IP dan unix socket (PostgreSQL lokal).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# Port 3000 > 1024, tidak butuh capability apa pun.
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+UMask=0077
+# Sengaja TIDAK memakai MemoryDenyWriteExecute=yes: JIT V8 butuh memori writable+executable, node akan crash.
+
+[Install]
+WantedBy=multi-user.target
