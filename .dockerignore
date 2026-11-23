@@ -1,0 +1,17 @@
+# Build context sekecil mungkin: lebih cepat dikirim ke builder, dan tidak ada rahasia yang ikut ter-COPY.
+node_modules
+dist
+.env
+.env.*
+!.env.example
+.git
+.github
+deploy
+scripts
+backups
+test
+coverage
+*.md
+Dockerfile
+.dockerignore
+compose*.yml

@@ -1,0 +1,72 @@
+# Stack lokal / CI: api di-build dari Dockerfile, plus PostgreSQL dan Redis.
+# Jalankan: docker compose up -d --build --wait
+# Nama project tetap, supaya volume dan network bernama tryout_* dari folder mana pun.
+name: tryout
+
+services:
+  api:
+    build: .
+    image: tryout-api:local
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      # Host "db" dan "redis" = nama service; DNS internal Compose yang me-resolve-nya.
+      DATABASE_URL: postgres://${POSTGRES_USER:-app}:${POSTGRES_PASSWORD:-app}@db:5432/${POSTGRES_DB:-tryout}
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "${API_PORT:-3000}:3000"
+    depends_on:
+      # service_healthy, bukan sekadar urutan start: api baru dibuat setelah healthcheck db dan redis lulus,
+      # karena migrasi saat startup gagal (exit 1) kalau PostgreSQL belum siap.
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Image alpine punya wget (busybox); curl tidak ada. Port 3000 = port di dalam container.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 15s
+      # Selama start_period cek tiap 1 detik, jadi `up --wait` cepat selesai.
+      start_interval: 1s
+    # App memaksa keluar sendiri setelah 10 detik; beri Docker sedikit lebih lama sebelum SIGKILL.
+    stop_grace_period: 15s
+
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-app}
+      POSTGRES_DB: ${POSTGRES_DB:-tryout}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1: saat init pertama, entrypoint menyalakan server sementara yang hanya listen di unix socket.
+      # Cek lewat TCP supaya tidak "healthy" sebelum server yang asli siap. $$ = $ literal untuk shell di container.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+      start_interval: 1s
+    # Tidak ada "ports": database hanya bisa diakses dari network Compose, tidak dari host.
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # Murni cache: tanpa persistence (data bisa hilang, tidak masalah), dan dibatasi memorinya dengan eviksi LRU.
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "64mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+      start_interval: 1s
+
+volumes:
+  # Named volume: data tetap ada setelah `docker compose down`, hilang hanya dengan `down -v`.
+  pgdata:
