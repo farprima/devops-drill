@@ -185,6 +185,8 @@ jobs:
           sudo ln -sf /etc/nginx/sites-available/tryout.conf /etc/nginx/sites-enabled/tryout.conf
           sudo rm -f /etc/nginx/sites-enabled/default
           sudo nginx -t
+          # nginx di runner terpasang tapi disabled; di VM cukup reload. enable --now = start sekarang dan saat boot.
+          sudo systemctl enable --now nginx
           sudo systemctl reload nginx
           curl -fsS http://localhost/health | jq -e '.status == "ok"'
           curl -fsS -X POST http://localhost/api/submissions -H 'Content-Type: application/json' -d '{"student":"Nginx","score":77}'
