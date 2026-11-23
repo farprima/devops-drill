@@ -146,7 +146,7 @@ Selesai kalau:
 
 ### Branch `reference`
 
-Ada branch `reference` berisi satu contoh solusi untuk L1-L5 yang sudah terbukti hijau di GitHub Actions. Jangan dibuka sebelum mencoba sendiri: mentor memakainya untuk membandingkan dan memberi petunjuk bertahap, jadi latihannya hilang kalau jawabannya sudah dibaca duluan.
+Ada branch `reference` berisi satu contoh solusi untuk L1-L5 yang sudah terbukti hijau di GitHub Actions. Untuk persiapan interview Newus 24 Nov, branch ini dibaca dan dijelaskan langsung (tidak cukup waktu menulis dari nol). Setelah itu, latihan L1-L5 dari editor kosong tetap layak dikerjakan tanpa mengintip.
 
 ## Solusi referensi (branch `reference`)
 
